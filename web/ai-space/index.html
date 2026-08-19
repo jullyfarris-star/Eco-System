@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AI Space — POC</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Arial; padding: 16px; }
+    .controls { margin-bottom: 12px; }
+    button { margin-right: 8px; }
+    #log { white-space: pre-wrap; background:#f6f6f6; padding:8px; border-radius:6px; height:240px; overflow:auto }
+    #tokenOverlay { position:fixed; inset:0; background:rgba(0,0,0,0.5); display:none; align-items:center; justify-content:center }
+    #tokenBox { background:white; padding:16px; border-radius:8px; width:320px }
+    input[type=text] { width:100%; padding:8px; margin-top:8px }
+  </style>
+</head>
+<body>
+  <h1>AI Space — POC</h1>
+  <div class="controls">
+    <button id="newRoom">✨ Нова кімната</button>
+    <button id="share">🔗 Поділитись</button>
+    <button id="deleteRoom">🗑️ Видалити кімнату</button>
+    <span id="status">(сервер: перевірка...)</span>
+  </div>
+
+  <div id="info"></div>
+  <h3>Console</h3>
+  <div id="log">Лог подій...</div>
+
+  <div id="tokenOverlay">
+    <div id="tokenBox">
+      <div>Будь ласка, вставте token (приватно отриманий від AI)</div>
+      <input id="tokenInput" type="text" placeholder="Вставте token сюди" />
+      <div style="margin-top:8px; text-align:right">
+        <button id="tokenCancel">Скасувати</button>
+        <button id="tokenSave">Зберегти</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+const API_BASE = (location.hostname === 'localhost') ? 'http://localhost:8001' : `${location.origin.replace(/:\d+$/,':8001')}`;
+const FRONTEND_BASE = location.origin.replace(/:\d+$/,':8000');
+
+const qs = new URLSearchParams(location.search);
+let session = qs.get('session');
+let token = qs.get('token');
+
+const logEl = document.getElementById('log');
+function log(...args){ logEl.textContent += '\n' + args.join(' '); logEl.scrollTop = logEl.scrollHeight }
+
+async function ping(){
+  try{ const r = await fetch(API_BASE + '/api/ping'); if(r.ok){ document.getElementById('status').textContent = '(сервер: доступний)'; return true } }
+  catch(e){ }
+  document.getElementById('status').textContent = '(сервер: недоступний)'; return false
+}
+
+async function createRoomAndOpen(){
+  // create via API, get session+token; open new tab with session (without token in url?) we will open with token omitted to follow security
+  try{
+    const r = await fetch(API_BASE + '/api/rooms', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({}) });
+    const j = await r.json();
+    session = j.session; token = j.token; // token received but we won't include in shared URL
+    // store token locally
+    localStorage.setItem(`ai_space_token_${session}`, token);
+    const url = `${location.origin}/web/ai-space/index.html?session=${session}`;
+    window.open(url, '_blank');
+  }catch(e){ log('createRoom error', e) }
+}
+
+async function registerFromOwner(ownerSession, ownerToken){
+  const resp = await fetch(API_BASE + '/api/rooms/register_from_room', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ owner_session: ownerSession, owner_token: ownerToken, frontend_base: FRONTEND_BASE }) });
+  return await resp.json();
+}
+
+function showTokenOverlay(){
+  document.getElementById('tokenOverlay').style.display = 'flex';
+}
+function hideTokenOverlay(){ document.getElementById('tokenOverlay').style.display = 'none' }
+
+document.getElementById('newRoom').addEventListener('click', async ()=>{
+  await createRoomAndOpen();
+});
+
+document.getElementById('share').addEventListener('click', ()=>{
+  if(!session){ alert('Нема session'); return }
+  // share url WITHOUT token
+  const url = `${location.origin}/web/ai-space/index.html?session=${session}`;
+  navigator.clipboard.writeText(url).then(()=> log('Скопійовано URL (без токена):', url));
+});
+
+document.getElementById('deleteRoom').addEventListener('click', async ()=>{
+  if(!session){ alert('Нема session'); return }
+  // need token to delete
+  const stored = localStorage.getItem(`ai_space_token_${session}`) || token;
+  if(!stored){ alert('Token відсутній. Спершу введіть token.'); showTokenOverlay(); return }
+  try{
+    const r = await fetch(API_BASE + `/api/rooms/${session}`, { method:'DELETE', headers: { 'Authorization': 'Bearer '+stored } });
+    if(r.ok){ log('Кімната видалена'); localStorage.removeItem(`ai_space_token_${session}`); }
+    else{ log('Помилка видалення', await r.text()) }
+  }catch(e){ log('delete error', e) }
+});
+
+// token overlay handlers
+document.getElementById('tokenSave').addEventListener('click', ()=>{
+  const val = document.getElementById('tokenInput').value.trim();
+  if(!val) return;
+  token = val;
+  if(session) localStorage.setItem(`ai_space_token_${session}`, token);
+  hideTokenOverlay();
+  log('Token збережено локально');
+  connectWSIfPossible();
+});
+document.getElementById('tokenCancel').addEventListener('click', ()=>{ hideTokenOverlay() });
+
+// on load: if session present but token missing, try to load from localStorage or prompt user
+(function init(){
+  ping();
+  if(session){
+    const stored = localStorage.getItem(`ai_space_token_${session}`);
+    if(stored){ token = stored; log('Token завантажено з localStorage'); }
+    else if(!token){ log('Token відсутній — попросіть AI надіслати його приватно і вставте в поле'); showTokenOverlay(); }
+    // try to fetch room state and show
+    if(token){ connectWSIfPossible(); }
+  } else {
+    log('Нема session у URL — створіть нову кімнату');
+  }
+  // autosave placeholder
+  setInterval(async ()=>{
+    if(!session) return;
+    const state = { objects: [] }; // placeholder
+    const stored = localStorage.getItem(`ai_space_token_${session}`) || token;
+    if(!stored) return;
+    try{
+      await fetch(API_BASE + `/api/rooms/${session}`, { method:'POST', headers:{ 'Content-Type':'application/json', 'Authorization':'Bearer '+stored }, body: JSON.stringify({ state }) });
+      log('Автозбережено');
+    }catch(e){ }
+  }, 10000);
+})();
+
+let ws;
+function connectWSIfPossible(){
+  if(!session) return;
+  const stored = localStorage.getItem(`ai_space_token_${session}`) || token;
+  if(!stored){ log('Не можу підключитись — token відсутній'); return }
+  const wsUrl = (location.hostname === 'localhost') ? `ws://localhost:8001/ws/${session}?token=${stored}` : `${location.origin.replace(/:\d+$/,':8001')}/ws/${session}?token=${stored}`;
+  try{
+    ws = new WebSocket(wsUrl);
+    ws.onopen = ()=> log('WS connected');
+    ws.onmessage = ev => log('WS recv:', ev.data);
+    ws.onclose = ()=> log('WS closed');
+    ws.onerror = e => log('WS error', e);
+  }catch(e){ log('WS connect failed', e) }
+}
+
+</script>
+</body>
+</html>
